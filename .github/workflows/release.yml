@@ -18,7 +18,8 @@ permissions:
   contents: write
 
 jobs:
-  prepare:
+  decide:
+    name: Check release requirements
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.decide.outputs.should_release }}
@@ -89,16 +90,17 @@ jobs:
         run: echo "release_timestamp=$(date -u +%s)" >> "$GITHUB_OUTPUT"
 
   test:
-    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    name: Run tests
+    if: ${{ needs.decide.outputs.should_release == 'true' }}
     needs:
-      - prepare
+      - decide
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.release_sha }}
+          ref: ${{ needs.decide.outputs.release_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -122,9 +124,10 @@ jobs:
         run: go test ./...
 
   build:
-    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    name: Build release artifacts
+    if: ${{ needs.decide.outputs.should_release == 'true' }}
     needs:
-      - prepare
+      - decide
       - test
     strategy:
       fail-fast: false
@@ -141,7 +144,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.release_sha }}
+          ref: ${{ needs.decide.outputs.release_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -171,9 +174,10 @@ jobs:
           path: dist/*
 
   release:
-    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    name: Create GitHub release
+    if: ${{ needs.decide.outputs.should_release == 'true' }}
     needs:
-      - prepare
+      - decide
       - build
     runs-on: ubuntu-latest
 
@@ -181,7 +185,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.release_sha }}
+          ref: ${{ needs.decide.outputs.release_sha }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -199,7 +203,7 @@ jobs:
           notes_json=$(mktemp)
           notes_file=$(mktemp)
           repo_name="${GITHUB_REPOSITORY#*/}"
-          release_timestamp="${{ needs.prepare.outputs.release_timestamp }}"
+          release_timestamp="${{ needs.decide.outputs.release_timestamp }}"
           release_tag="Release-${release_timestamp}"
           release_name="${repo_name} @ ${release_timestamp} UTC"
 
@@ -214,7 +218,7 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
             -f tag_name="$release_tag" \
-            -f target_commitish="${{ needs.prepare.outputs.release_sha }}" > "$notes_json"
+            -f target_commitish="${{ needs.decide.outputs.release_sha }}" > "$notes_json"
 
           generated_name=$(jq -r '.name' "$notes_json")
           jq -r '.body' "$notes_json" > "$notes_file"
@@ -227,5 +231,5 @@ jobs:
             gh release edit "$release_tag" --title "$release_name" --notes-file "$notes_file"
             gh release upload "$release_tag" "${files[@]}" --clobber
           else
-            gh release create "$release_tag" "${files[@]}" --target "${{ needs.prepare.outputs.release_sha }}" --title "$release_name" --notes-file "$notes_file"
+            gh release create "$release_tag" "${files[@]}" --target "${{ needs.decide.outputs.release_sha }}" --title "$release_name" --notes-file "$notes_file"
           fi
