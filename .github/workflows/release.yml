@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - active
+  workflow_run:
+    workflows:
+      - Dependabot Auto-Merge
+    types:
+      - completed
 
 concurrency:
   group: release-${{ github.ref }}
@@ -16,20 +21,84 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      release_sha: ${{ steps.decide.outputs.release_sha }}
       release_timestamp: ${{ steps.timestamp.outputs.release_timestamp }}
 
     steps:
+      - name: Decide whether to publish a release
+        id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "[release] event_name=${{ github.event_name }}"
+          echo "[release] github.ref=${GITHUB_REF}"
+          echo "[release] workflow_run.conclusion=${{ github.event.workflow_run.conclusion }}"
+          echo "[release] workflow_run.head_branch=${{ github.event.workflow_run.head_branch }}"
+          echo "[release] workflow_run.head_sha=${{ github.event.workflow_run.head_sha }}"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "[release] path=push -> releasing ${GITHUB_SHA}"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "release_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+            echo "[release] workflow_run conclusion is not success -> skip"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          active_sha=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/branches/active" \
+            --jq '.commit.sha')
+
+          if [ -z "$active_sha" ] || [ "$active_sha" = "null" ]; then
+            echo "[release] could not resolve active branch head SHA -> skip"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_target=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            --jq '.target_commitish' 2>/dev/null || true)
+
+          echo "[release] active_sha=${active_sha}"
+          echo "[release] latest_release_target=${latest_target}"
+
+          if [ -n "$latest_target" ] && [ "$latest_target" != "null" ] && [ "$latest_target" = "$active_sha" ]; then
+            echo "[release] decision=skip (latest release already targets active head)"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "[release] decision=release (active head differs from latest release target)"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$active_sha" >> "$GITHUB_OUTPUT"
+
       - name: Compute release timestamp
         id: timestamp
+        if: ${{ steps.decide.outputs.should_release == 'true' }}
         shell: bash
         run: echo "release_timestamp=$(date -u +%s)" >> "$GITHUB_OUTPUT"
 
   test:
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    needs:
+      - prepare
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -53,6 +122,7 @@ jobs:
         run: go test ./...
 
   build:
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
     needs:
       - prepare
       - test
@@ -70,6 +140,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -99,6 +171,7 @@ jobs:
           path: dist/*
 
   release:
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
     needs:
       - prepare
       - build
@@ -107,6 +180,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -139,7 +214,7 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
             -f tag_name="$release_tag" \
-            -f target_commitish="$GITHUB_SHA" > "$notes_json"
+            -f target_commitish="${{ needs.prepare.outputs.release_sha }}" > "$notes_json"
 
           generated_name=$(jq -r '.name' "$notes_json")
           jq -r '.body' "$notes_json" > "$notes_file"
@@ -152,5 +227,5 @@ jobs:
             gh release edit "$release_tag" --title "$release_name" --notes-file "$notes_file"
             gh release upload "$release_tag" "${files[@]}" --clobber
           else
-            gh release create "$release_tag" "${files[@]}" --target "$GITHUB_SHA" --title "$release_name" --notes-file "$notes_file"
+            gh release create "$release_tag" "${files[@]}" --target "${{ needs.prepare.outputs.release_sha }}" --title "$release_name" --notes-file "$notes_file"
           fi
