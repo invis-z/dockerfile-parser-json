@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   decide:
-    name: Check release requirements
+    name: Decide Release Context
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.decide.outputs.should_release }}
@@ -33,61 +33,69 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "[release] event_name=${{ github.event_name }}"
-          echo "[release] github.ref=${GITHUB_REF}"
-          echo "[release] workflow_run.conclusion=${{ github.event.workflow_run.conclusion }}"
-          echo "[release] workflow_run.head_branch=${{ github.event.workflow_run.head_branch }}"
-          echo "[release] workflow_run.head_sha=${{ github.event.workflow_run.head_sha }}"
+          set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "[release] path=push -> releasing ${GITHUB_SHA}"
+          echo "event_name=${{ github.event_name }}"
+          echo "github_ref=${GITHUB_REF}"
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "workflow_run.conclusion=${{ github.event.workflow_run.conclusion }}"
+            echo "workflow_run.head_branch=${{ github.event.workflow_run.head_branch }}"
+            echo "workflow_run.head_sha=${{ github.event.workflow_run.head_sha }}"
+            if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+              echo "decision=skip"
+              echo "reason=workflow_run_not_success"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            active_sha=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/branches/active" \
+              --jq '.commit.sha')
+
+            if [ -z "$active_sha" ] || [ "$active_sha" = "null" ]; then
+              echo "ERROR: could not resolve active branch head SHA." >&2
+              exit 1
+            fi
+
+            latest_target=$(gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --limit 1 \
+              --json targetCommitish \
+              --jq '.[0].targetCommitish')
+
+            echo "active_sha=${active_sha}"
+            echo "latest_release_target=${latest_target}"
+
+            if [ -n "$latest_target" ] && [ "$latest_target" != "null" ] && [ "$latest_target" = "$active_sha" ]; then
+              echo "decision=skip"
+              echo "reason=latest_release_targets_active_sha"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "decision=release"
+            echo "release_sha=${active_sha}"
             echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "release_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "release_sha=$active_sha" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
-            echo "[release] workflow_run conclusion is not success -> skip"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          active_sha=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/${GITHUB_REPOSITORY}/branches/active" \
-            --jq '.commit.sha')
-
-          if [ -z "$active_sha" ] || [ "$active_sha" = "null" ]; then
-            echo "[release] could not resolve active branch head SHA -> skip"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          latest_target=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/${GITHUB_REPOSITORY}/releases/latest" \
-            --jq '.target_commitish' 2>/dev/null || true)
-
-          echo "[release] active_sha=${active_sha}"
-          echo "[release] latest_release_target=${latest_target}"
-
-          if [ -n "$latest_target" ] && [ "$latest_target" != "null" ] && [ "$latest_target" = "$active_sha" ]; then
-            echo "[release] decision=skip (latest release already targets active head)"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "[release] decision=release (active head differs from latest release target)"
+          echo "Standard trigger path, using current SHA: $GITHUB_SHA"
+          echo "decision=release"
+          echo "release_sha=${GITHUB_SHA}"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
-          echo "release_sha=$active_sha" >> "$GITHUB_OUTPUT"
+          echo "release_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Compute release timestamp
         id: timestamp
         if: ${{ steps.decide.outputs.should_release == 'true' }}
         shell: bash
-        run: echo "release_timestamp=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          echo "release_timestamp=$(date -u +%s)" >> "$GITHUB_OUTPUT"
 
   test:
     name: Run tests
@@ -113,6 +121,7 @@ jobs:
 
       - name: Verify formatting
         run: |
+          set -euo pipefail
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             echo "The following files need gofmt:"
@@ -130,7 +139,7 @@ jobs:
       - decide
       - test
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - goos: linux
@@ -159,6 +168,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
+          set -euo pipefail
           mkdir -p dist
           asset_name="dockerfile-parser-json-${GOOS}-${GOARCH}"
           if [ "$GOOS" = "windows" ]; then
@@ -198,38 +208,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           shopt -s nullglob
           files=(dist/*)
-          notes_json=$(mktemp)
-          notes_file=$(mktemp)
-          repo_name="${GITHUB_REPOSITORY#*/}"
           release_timestamp="${{ needs.decide.outputs.release_timestamp }}"
           release_tag="Release-${release_timestamp}"
-          release_name="${repo_name} @ ${release_timestamp} UTC"
+
+          echo "release_tag=${release_tag}"
+          echo "release_sha=${{ needs.decide.outputs.release_sha }}"
+          echo "artifact_count=${#files[@]}"
+          if [ ${#files[@]} -gt 0 ]; then
+            printf 'artifact=%s\n' "${files[@]}"
+          fi
 
           if [ ${#files[@]} -eq 0 ]; then
             echo "No release artifacts found in dist/."
             exit 1
           fi
 
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-            -f tag_name="$release_tag" \
-            -f target_commitish="${{ needs.decide.outputs.release_sha }}" > "$notes_json"
-
-          generated_name=$(jq -r '.name' "$notes_json")
-          jq -r '.body' "$notes_json" > "$notes_file"
-
-          if [ -n "$generated_name" ] && [ "$generated_name" != "null" ]; then
-            release_name="$generated_name"
-          fi
-
-          if gh release view "$release_tag" >/dev/null 2>&1; then
-            gh release edit "$release_tag" --title "$release_name" --notes-file "$notes_file"
+          release_lookup_err_file=$(mktemp)
+          if release_lookup_json=$(gh release view "$release_tag" --json id,tagName,targetCommitish,url 2>"$release_lookup_err_file"); then
+            echo "release_exists=true"
+            printf '%s\n' "$release_lookup_json"
+            gh release edit "$release_tag" --generate-notes
             gh release upload "$release_tag" "${files[@]}" --clobber
           else
-            gh release create "$release_tag" "${files[@]}" --target "${{ needs.decide.outputs.release_sha }}" --title "$release_name" --notes-file "$notes_file"
+            release_lookup_error=$(cat "$release_lookup_err_file")
+            if printf '%s\n' "$release_lookup_error" | grep -Eq '^release not found'; then
+              echo "release_exists=false"
+              gh release create "$release_tag" "${files[@]}" \
+                --target "${{ needs.decide.outputs.release_sha }}" \
+                --generate-notes
+            else
+              echo "ERROR: release lookup failed for tag ${release_tag}" >&2
+              printf '%s\n' "$release_lookup_error"
+              rm -f "$release_lookup_err_file"
+              exit 1
+            fi
           fi
+
+          rm -f "$release_lookup_err_file"
