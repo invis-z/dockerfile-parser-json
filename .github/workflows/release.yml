@@ -60,11 +60,19 @@ jobs:
               exit 1
             fi
 
-            latest_target=$(gh release list \
+            latest_target=""
+            latest_tag=$(gh release list \
               --repo "${GITHUB_REPOSITORY}" \
               --limit 1 \
-              --json targetCommitish \
-              --jq '.[0].targetCommitish')
+              --json tagName \
+              --jq '.[0].tagName')
+
+            if [ -n "$latest_tag" ] && [ "$latest_tag" != "null" ]; then
+              latest_target=$(gh release view "$latest_tag" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --json targetCommitish \
+                --jq '.targetCommitish')
+            fi
 
             echo "active_sha=${active_sha}"
             echo "latest_release_target=${latest_target}"
