@@ -2,7 +2,7 @@ module github.com/invis-z/dockerfile-parser-json
 
 go 1.26.8
 
-require github.com/moby/buildkit v0.34.0
+require github.com/moby/buildkit v0.34.1
 
 require (
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
